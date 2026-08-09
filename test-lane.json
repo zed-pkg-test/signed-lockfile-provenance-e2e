@@ -1,0 +1,15 @@
+{
+  "bootstrap_date": "2026-08-08",
+  "default_branch": "main",
+  "description": "Certify lockfile provenance signatures, tamper rejection, and deterministic verification.",
+  "fleet_manifest_sha256": "5d1cf8cb7af82a81660bf2fe7536759c7b15bd01bef4a4a04730095ad998d056",
+  "force_push_allowed": false,
+  "full_name": "zed-pkg-test/signed-lockfile-provenance-e2e",
+  "lane": "supply-chain",
+  "organization": "zed-pkg-test",
+  "repository": "signed-lockfile-provenance-e2e",
+  "schema_version": 1,
+  "semantic_conflict_resolution_required": true,
+  "tracking_issue": "DEN-3286",
+  "visibility": "public"
+}
