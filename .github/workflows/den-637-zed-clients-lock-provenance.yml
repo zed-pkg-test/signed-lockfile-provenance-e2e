@@ -20,6 +20,7 @@ jobs:
       ZED_CLIENTS_HEAD: 4f1fa65a2c49cedb3d4a665f980a213ee4a73491
       ZED_INTERFACES_TAG: v0.1.0
       ZED_INTERFACES_TAG_COMMIT: 5394b2e7b070354ee79a4c6ac79c26d6264970cd
+      ZED_INTERFACES_REGISTRY_SHA256: a2b695d68ac469941d465b0bb78dd191e65e7480412ad7e1ba28aaf0534b7ba4
     steps:
       - name: Checkout canary
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -32,6 +33,14 @@ jobs:
           repository: zed-pkg/zed-clients
           ref: ${{ env.ZED_CLIENTS_HEAD }}
           path: candidate
+          persist-credentials: false
+
+      - name: Checkout exact zed-interfaces release source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: zed-pkg/zed-interfaces
+          ref: ${{ env.ZED_INTERFACES_TAG_COMMIT }}
+          path: dependency-source
           persist-credentials: false
 
       - name: Install exact released zed-cli
@@ -50,6 +59,23 @@ jobs:
           test -n "$zed_bin"
           "$zed_bin" --version
           printf 'ZED_BIN=%s\n' "$zed_bin" >> "$GITHUB_ENV"
+
+      - name: Repack exact dependency source and compare registry digest
+        working-directory: dependency-source
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/zed-interfaces-pack"
+          rm -rf "$out"
+          mkdir -p "$out"
+          "$ZED_BIN" pack --out "$out"
+          archive="$(find "$out" -maxdepth 1 -type f -name 'zed-interfaces-0.1.0.tar.gz' -print -quit)"
+          test -n "$archive"
+          actual="$(sha256sum "$archive" | awk '{print $1}')"
+          printf 'registry-selected digest: %s\nrepacked tagged-source digest: %s\n' \
+            "$ZED_INTERFACES_REGISTRY_SHA256" "$actual"
+          test "$actual" = "$ZED_INTERFACES_REGISTRY_SHA256"
+          printf '%s  %s\n' "$actual" "$(basename "$archive")" > ../dependency-source-SHA256SUMS
 
       - name: Verify authored dependency and historical placeholder
         working-directory: candidate
@@ -92,6 +118,7 @@ jobs:
           missing = [k for k in required if k not in p or p[k] in ('', None)]
           assert not missing, f'missing immutable provenance: {missing}'
           assert p['version'] == '0.1.0', p['version']
+          assert p['sha256'] == 'a2b695d68ac469941d465b0bb78dd191e65e7480412ad7e1ba28aaf0534b7ba4', p['sha256']
           assert p['vcs_tag'] == 'v0.1.0', p['vcs_tag']
           assert p['vcs_commit'] == '5394b2e7b070354ee79a4c6ac79c26d6264970cd', p['vcs_commit']
           receipt = {
@@ -108,7 +135,7 @@ jobs:
           print(json.dumps(receipt, indent=2, sort_keys=True))
           PY
 
-      - name: Upload resolver-produced lock and receipt
+      - name: Upload resolver-produced lock and bounded receipts
         if: ${{ always() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
@@ -118,3 +145,4 @@ jobs:
           path: |
             candidate/.zpkg.lock
             resolver-receipt.json
+            dependency-source-SHA256SUMS
