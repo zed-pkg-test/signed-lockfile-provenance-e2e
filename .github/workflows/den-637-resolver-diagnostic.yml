@@ -62,12 +62,25 @@ jobs:
         working-directory: dependency-source
         shell: bash
         run: |
-          set -euo pipefail
+          set -u -o pipefail
           out="$RUNNER_TEMP/dependency-pack"
           mkdir -p "$out"
-          "$ZED_BIN" pack --out "$out"
-          archive="$(find "$out" -maxdepth 1 -type f -name '*zed-interfaces-0.1.0.tar.gz' -print -quit)"
-          test -n "$archive"
+          set +e
+          "$ZED_BIN" pack --out "$out" > ../dependency-pack.log 2>&1
+          pack_status=$?
+          set -e
+          cat ../dependency-pack.log
+          printf 'PACK_STATUS=%s\n' "$pack_status" >> "$GITHUB_ENV"
+
+          archive="$(find "$out" -maxdepth 1 -type f -name '*zed-interfaces-0.1.0.tar.gz' -print -quit || true)"
+          if [[ -z "$archive" ]]; then
+            printf 'DEPENDENCY_DIGEST_MATCH=false\n' >> "$GITHUB_ENV"
+            printf 'pack_status=%s\nregistry_digest=%s\nrepacked_digest=NOT_PRODUCED\n' \
+              "$pack_status" "$ZED_INTERFACES_REGISTRY_SHA256" \
+              | tee ../dependency-digest-classification.txt
+            exit 0
+          fi
+
           actual="$(sha256sum "$archive" | awk '{print $1}')"
           printf '%s  %s\n' "$actual" "$(basename "$archive")" > ../dependency-source-SHA256SUMS
           if [[ "$actual" == "$ZED_INTERFACES_REGISTRY_SHA256" ]]; then
@@ -75,8 +88,10 @@ jobs:
           else
             printf 'DEPENDENCY_DIGEST_MATCH=false\n' >> "$GITHUB_ENV"
           fi
-          printf 'registry_digest=%s\nrepacked_digest=%s\n' "$ZED_INTERFACES_REGISTRY_SHA256" "$actual" \
+          printf 'pack_status=%s\nregistry_digest=%s\nrepacked_digest=%s\n' \
+            "$pack_status" "$ZED_INTERFACES_REGISTRY_SHA256" "$actual" \
             | tee ../dependency-digest-classification.txt
+          exit 0
 
       - name: Verify authored dependency and placeholder precondition
         working-directory: candidate
@@ -136,6 +151,7 @@ jobs:
           retention-days: 7
           if-no-files-found: warn
           path: |
+            dependency-pack.log
             dependency-source-SHA256SUMS
             dependency-digest-classification.txt
             zed-install.log
@@ -147,5 +163,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          test "${PACK_STATUS:-1}" = 0
           test "${DEPENDENCY_DIGEST_MATCH:-false}" = true
           test "${RESOLVE_STATUS:-1}" = 0
