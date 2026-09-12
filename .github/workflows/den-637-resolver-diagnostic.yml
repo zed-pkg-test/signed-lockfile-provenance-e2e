@@ -1,0 +1,168 @@
+name: DEN-637 resolver diagnostic
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/den-637-resolver-diagnostic.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  resolve-after-provenance-drift:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    env:
+      ZED_CLI_VERSION: v0.3.0
+      ZED_CLI_COMMIT: b38a1edd2ca7852bc81ad2e01e2989f44009e93e
+      ZED_CLI_LINUX_GNU_SHA256: f87576bc289e43ed647902527e7be70566445d2f1fd11249f067ab35547d4b8a
+      ZED_CLIENTS_HEAD: 4f1fa65a2c49cedb3d4a665f980a213ee4a73491
+      ZED_INTERFACES_TAG_COMMIT: 5394b2e7b070354ee79a4c6ac79c26d6264970cd
+      ZED_INTERFACES_REGISTRY_SHA256: a2b695d68ac469941d465b0bb78dd191e65e7480412ad7e1ba28aaf0534b7ba4
+    steps:
+      - name: Checkout canary
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - name: Checkout exact zed-clients candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: zed-pkg/zed-clients
+          ref: ${{ env.ZED_CLIENTS_HEAD }}
+          path: candidate
+          persist-credentials: false
+
+      - name: Checkout exact dependency source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: zed-pkg/zed-interfaces
+          ref: ${{ env.ZED_INTERFACES_TAG_COMMIT }}
+          path: dependency-source
+          persist-credentials: false
+
+      - name: Install exact released zed-cli
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/zed.tar.gz"
+          mkdir -p "$RUNNER_TEMP/zed-bin"
+          curl --fail --location --proto '=https' --tlsv1.2 --retry 3 --retry-all-errors \
+            -o "$archive" \
+            "https://github.com/zed-pkg/zed-cli/releases/download/${ZED_CLI_VERSION}/zed-x86_64-unknown-linux-gnu.tar.gz"
+          printf '%s  %s\n' "$ZED_CLI_LINUX_GNU_SHA256" "$archive" | sha256sum --check --strict
+          tar -xzf "$archive" -C "$RUNNER_TEMP/zed-bin"
+          zed_bin="$(find "$RUNNER_TEMP/zed-bin" -type f -name zed -perm -u+x -print -quit)"
+          test -n "$zed_bin"
+          "$zed_bin" --version
+          printf 'ZED_BIN=%s\n' "$zed_bin" >> "$GITHUB_ENV"
+
+      - name: Record dependency source-artifact drift without short-circuiting resolver
+        working-directory: dependency-source
+        shell: bash
+        run: |
+          set -u -o pipefail
+          out="$RUNNER_TEMP/dependency-pack"
+          mkdir -p "$out"
+          set +e
+          "$ZED_BIN" pack --out "$out" > ../dependency-pack.log 2>&1
+          pack_status=$?
+          set -e
+          cat ../dependency-pack.log
+          printf 'PACK_STATUS=%s\n' "$pack_status" >> "$GITHUB_ENV"
+
+          archive="$(find "$out" -maxdepth 1 -type f -name '*zed-interfaces-0.1.0.tar.gz' -print -quit || true)"
+          if [[ -z "$archive" ]]; then
+            printf 'DEPENDENCY_DIGEST_MATCH=false\n' >> "$GITHUB_ENV"
+            printf 'pack_status=%s\nregistry_digest=%s\nrepacked_digest=NOT_PRODUCED\n' \
+              "$pack_status" "$ZED_INTERFACES_REGISTRY_SHA256" \
+              | tee ../dependency-digest-classification.txt
+            exit 0
+          fi
+
+          actual="$(sha256sum "$archive" | awk '{print $1}')"
+          printf '%s  %s\n' "$actual" "$(basename "$archive")" > ../dependency-source-SHA256SUMS
+          if [[ "$actual" == "$ZED_INTERFACES_REGISTRY_SHA256" ]]; then
+            printf 'DEPENDENCY_DIGEST_MATCH=true\n' >> "$GITHUB_ENV"
+          else
+            printf 'DEPENDENCY_DIGEST_MATCH=false\n' >> "$GITHUB_ENV"
+          fi
+          printf 'pack_status=%s\nregistry_digest=%s\nrepacked_digest=%s\n' \
+            "$pack_status" "$ZED_INTERFACES_REGISTRY_SHA256" "$actual" \
+            | tee ../dependency-digest-classification.txt
+          exit 0
+
+      - name: Verify authored dependency and placeholder precondition
+        working-directory: candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import pathlib, tomllib
+          manifest = tomllib.loads(pathlib.Path('.zpkg.toml').read_text())
+          lock = tomllib.loads(pathlib.Path('.zpkg.lock').read_text())
+          assert manifest.get('dependencies', {}).get('zed-pkg/zed-interfaces') == '^0.1.0'
+          assert lock.get('version') == 1
+          assert not lock.get('package'), 'candidate placeholder changed; update canary before interpreting results'
+          PY
+
+      - name: Attempt real resolver despite known provenance drift
+        working-directory: candidate
+        shell: bash
+        run: |
+          set -uo pipefail
+          cp .zpkg.lock "$RUNNER_TEMP/placeholder.zpkg.lock"
+          rm .zpkg.lock
+          set +e
+          "$ZED_BIN" install > ../zed-install.log 2>&1
+          status=$?
+          set -e
+          cat ../zed-install.log
+          printf 'RESOLVE_STATUS=%s\n' "$status" >> "$GITHUB_ENV"
+          if [[ "$status" -eq 0 ]]; then
+            "$ZED_BIN" validate --require-lock
+          fi
+          exit 0
+
+      - name: Record resolver-produced immutable provenance when available
+        if: ${{ env.RESOLVE_STATUS == '0' }}
+        working-directory: candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, pathlib, tomllib
+          lock = tomllib.loads(pathlib.Path('.zpkg.lock').read_text())
+          matches = [p for p in lock.get('package', []) if p.get('org') == 'zed-pkg' and p.get('name') == 'zed-interfaces']
+          assert len(matches) == 1, matches
+          p = matches[0]
+          required = ('org','name','version','sha256','size','format','vcs_tag','vcs_commit','source')
+          missing = [k for k in required if p.get(k) in ('', None)]
+          assert not missing, missing
+          pathlib.Path('../resolver-receipt.json').write_text(json.dumps({k:p[k] for k in required}, indent=2, sort_keys=True) + '\n')
+          PY
+
+      - name: Upload bounded diagnostic evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: zed-clients-resolver-diagnostic-${{ github.run_id }}-${{ github.run_attempt }}
+          retention-days: 7
+          if-no-files-found: warn
+          path: |
+            dependency-pack.log
+            dependency-source-SHA256SUMS
+            dependency-digest-classification.txt
+            zed-install.log
+            candidate/.zpkg.lock
+            resolver-receipt.json
+
+      - name: Fail closed after collecting all evidence
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "${PACK_STATUS:-1}" = 0
+          test "${DEPENDENCY_DIGEST_MATCH:-false}" = true
+          test "${RESOLVE_STATUS:-1}" = 0
